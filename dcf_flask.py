@@ -17,9 +17,11 @@ dcf+反向dcf网页版本
 # ==============================================================================
 app = Flask(__name__)
 
-# --- AI 配置 ---
-API_KEY = "sk-XXXXXXXXXXXXXXXXXXXXXXXXXXX"
+# --- AI 配置 ---@
+API_KEY = "sk-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
 try:
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 except Exception as e:
@@ -27,7 +29,7 @@ except Exception as e:
     client = None
 
 # --- Tushare 配置 ---
-TS_TOKEN = "XXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+TS_TOKEN = "XXXXXXXXXXXXXXXXXXXXXXXXXX"
 try:
     ts.set_token(TS_TOKEN)
     pro = ts.pro_api()
@@ -66,6 +68,7 @@ def check_and_update_data():
         return pd.read_csv(data_file, dtype={'symbol': str, 'ts_code': str})
     return None
 
+
 def resolve_stock_query(query: str):
     """根据输入的 6位代码 或 公司名称 解析出 ts_code 和 标准全称"""
     df = check_and_update_data()
@@ -80,6 +83,7 @@ def resolve_stock_query(query: str):
     if not res.empty:
         return res.iloc[0]['ts_code'], res.iloc[0]['name']
     return None, None
+
 
 def get_company_full_name_by_selector(stock_code_6digit: str):
     """从同花顺爬取公司全名及简介"""
@@ -99,47 +103,84 @@ def get_company_full_name_by_selector(stock_code_6digit: str):
         print(f"爬取F10公司简介失败: {e}")
     return ""
 
-def fetch_latest_annual_report(ts_code: str):
-    """从 Tushare 获取三大表最新一年(1231)的数据并格式化为文本"""
+
+def fetch_last_x_years_annual_reports(ts_code: str, x: int = 3, target_report_type: str = '1'):
+    """
+    从 Tushare 获取三大表最近 X 年(1231)的数据并格式化为文本
+    :param ts_code: 股票代码，如 '000001.SZ'
+    :param x: 获取最近 X 年的年报，默认为 3 年
+    :param target_report_type: 报表类型。'1'为合并报表(估值推荐使用)，'6'或对应代码为母公司报表
+    """
     if not pro: return ""
 
-    start_dt = (datetime.now() - timedelta(days=365 * 4)).strftime('%Y%m%d')
+    start_dt = (datetime.now() - timedelta(days=365 * (x + 2))).strftime('%Y%m%d')
     end_dt = datetime.now().strftime('%Y%m%d')
-    report_texts =[]
+
+    def get_clean_statement(api_func, **kwargs):
+        df = api_func(**kwargs)
+        if df.empty: return pd.DataFrame()
+
+        # 1. 筛选年报(12月31日)
+        df = df[df['end_date'].str.endswith('1231')]
+
+        # 2. 筛选报表类型 (重点在这里)
+        if 'report_type' in df.columns:
+            df = df[df['report_type'] == target_report_type]
+
+        # 3. 按报告期和公告日期降序排列并去重（保留最新更正版本）
+        if not df.empty and 'ann_date' in df.columns:
+            df = df.sort_values(['end_date', 'ann_date'], ascending=[False, False])
+            df = df.drop_duplicates(subset=['end_date'], keep='first')
+        else:
+            df = df.sort_values('end_date', ascending=False)
+            df = df.drop_duplicates(subset=['end_date'], keep='first')
+
+        return df.head(x)
 
     try:
-        # 1. 利润表 (Income Statement)
-        df_inc = pro.income(ts_code=ts_code, start_date=start_dt, end_date=end_dt)
-        if not df_inc.empty:
-            annual_inc = df_inc[df_inc['end_date'].str.endswith('1231')].sort_values('end_date', ascending=False)
-            if not annual_inc.empty:
-                # dropna 抛弃空值，减少 token 消耗
-                inc_dict = annual_inc.iloc[0].dropna().to_dict()
-                report_texts.append(
-                    f"【利润表 ({inc_dict.get('end_date', '')})】\n{json.dumps(inc_dict, ensure_ascii=False)}")
+        # 依次获取三大表数据
+        df_inc = get_clean_statement(pro.income, ts_code=ts_code, start_date=start_dt, end_date=end_dt)
+        df_bs = get_clean_statement(pro.balancesheet, ts_code=ts_code, start_date=start_dt, end_date=end_dt)
+        df_cf = get_clean_statement(pro.cashflow, ts_code=ts_code, start_date=start_dt, end_date=end_dt)
 
-        # 2. 资产负债表 (Balance Sheet)
-        df_bs = pro.balancesheet(ts_code=ts_code, start_date=start_dt, end_date=end_dt)
-        if not df_bs.empty:
-            annual_bs = df_bs[df_bs['end_date'].str.endswith('1231')].sort_values('end_date', ascending=False)
-            if not annual_bs.empty:
-                bs_dict = annual_bs.iloc[0].dropna().to_dict()
-                report_texts.append(
-                    f"【资产负债表 ({bs_dict.get('end_date', '')})】\n{json.dumps(bs_dict, ensure_ascii=False)}")
+        all_end_dates = set()
+        for df in [df_inc, df_bs, df_cf]:
+            if not df.empty:
+                all_end_dates.update(df['end_date'].tolist())
 
-        # 3. 现金流量表 (Cash Flow)
-        df_cf = pro.cashflow(ts_code=ts_code, start_date=start_dt, end_date=end_dt)
-        if not df_cf.empty:
-            annual_cf = df_cf[df_cf['end_date'].str.endswith('1231')].sort_values('end_date', ascending=False)
-            if not annual_cf.empty:
-                cf_dict = annual_cf.iloc[0].dropna().to_dict()
-                report_texts.append(
-                    f"【现金流量表 ({cf_dict.get('end_date', '')})】\n{json.dumps(cf_dict, ensure_ascii=False)}")
+        target_dates = sorted(list(all_end_dates), reverse=True)[:x]
+        report_texts = []
+
+        report_name = "合并报表" if target_report_type == '1' else "母公司/单体报表"
+
+        for edate in target_dates:
+            year_text = f"=========== 【{edate[:4]}年 年度报告 ({report_name} 报告期:{edate})】 ==========="
+
+            if not df_inc.empty and edate in df_inc['end_date'].values:
+                inc_dict = df_inc[df_inc['end_date'] == edate].iloc[0].drop(
+                    labels=['ts_code', 'end_date', 'report_type'], errors='ignore'
+                ).dropna().to_dict()
+                year_text += f"\n[利润表]\n{json.dumps(inc_dict, ensure_ascii=False)}"
+
+            if not df_bs.empty and edate in df_bs['end_date'].values:
+                bs_dict = df_bs[df_bs['end_date'] == edate].iloc[0].drop(
+                    labels=['ts_code', 'end_date', 'report_type', 'ann_date', 'f_ann_date'], errors='ignore'
+                ).dropna().to_dict()
+                year_text += f"\n\n[资产负债表]\n{json.dumps(bs_dict, ensure_ascii=False)}"
+
+            if not df_cf.empty and edate in df_cf['end_date'].values:
+                cf_dict = df_cf[df_cf['end_date'] == edate].iloc[0].drop(
+                    labels=['ts_code', 'end_date', 'report_type', 'ann_date', 'f_ann_date'], errors='ignore'
+                ).dropna().to_dict()
+                year_text += f"\n\n[现金流量表]\n{json.dumps(cf_dict, ensure_ascii=False)}"
+
+            report_texts.append(year_text)
+
+        return "\n\n".join(report_texts)
 
     except Exception as e:
         print(f"获取财报发生错误: {e}")
-
-    return "\n\n".join(report_texts)
+        return ""
 
 
 # ==============================================================================
@@ -244,7 +285,7 @@ def api_autofetch():
         if not comp_desc:
             comp_desc = f"{stock_name} (自动提取同花顺F10简介失败，您可以手动输入补充)"
 
-        fin_text = fetch_latest_annual_report(ts_code)
+        fin_text = fetch_last_x_years_annual_reports(ts_code, 2)
         if not fin_text:
             return jsonify({"status": "error",
                             "message": f"成功找到 {stock_name}({ts_code})，但未能获取到最近4年的完整年报数据，请确认其是否有公开数据。"})
@@ -262,6 +303,16 @@ def api_autofetch():
 @app.route('/api/generate', methods=['POST'])
 def ai_generate():
     data = request.json
+    try:
+        proj_years = int(data.get('projection_years', 5))
+    except (ValueError, TypeError):
+        proj_years = 5
+
+    # 动态生成符合要求长度的示例数组（如果传进来是10，数组长度就严格为10）
+    example_growth = [round(max(0.15 - i * 0.01, 0.05), 2) for i in range(proj_years)]
+    example_margin = [round(min(0.10 + i * 0.01, 0.25), 2) for i in range(proj_years)]
+    example_reinv = [0.15] * proj_years
+
     prompt = f"""
 你是一位顶级的金融分析师，任务是为一家公司进行DCF估值前的参数准备。
 请根据提供的原始信息，深入分析该公司的行业特性和商业模式，并严格按照指定的JSON格式生成一个参数字典。
@@ -275,13 +326,14 @@ def ai_generate():
 3. **商业模式与资产轻重判定**：判断其属于轻资产、重资产还是科技/成长驱动型。
 4. **再投资率 (Reinvestment Rate)**：轻资产极小(10%~30%)，重资产适中或极高(40%~80%)，科技型前期极高(60%~120%)后期下降。
 5. **息税前利润率 (EBIT Margin)**：合理给出预测，如处于亏损可给出未来扭亏为盈路径或如实填负数。
+6. **预测期长度（极度重要）**：用户设定的预测年数为 **{proj_years}年**。你必须严格按照此年数生成 `scenario` 中的三个数组（revenue_growth_rates, ebit_margin_rates, reinvestment_rate），每个数组的元素个数必须**刚好等于 {proj_years}**！
 
 --- 原始输入信息 ---
 公司名称: {data.get('company_name', '')}
 公司描述: {data.get('company_description', '')}
 财务报表数据: {data.get('financial_statements', '')}
 额外指导: {data.get('additional_guidance', '')}
-预测年数: {data.get('projection_years', 5)}
+预测年数: {proj_years}
 
 --- 必须严格返回的 JSON 格式 ---
 ```json
@@ -294,19 +346,18 @@ def ai_generate():
         "cash_and_equivalents": 12000.0
     }},
     "valuation_assumptions": {{
-        "projection_years": {data.get('projection_years', 5)},
+        "projection_years": {proj_years},
         "discount_rate": 0.10,
         "terminal_growth_rate": 0.02
     }},
     "scenario": {{
-        "revenue_growth_rates":[0.15, 0.12, 0.10, 0.08, 0.05],
-        "ebit_margin_rates":[0.10, 0.12, 0.15, 0.16, 0.18],
-        "reinvestment_rate":[0.15, 0.15, 0.15, 0.15, 0.15]
+        "revenue_growth_rates": {example_growth},
+        "ebit_margin_rates": {example_margin},
+        "reinvestment_rate": {example_reinv}
     }}
 }}
 ```
 """
-    print(prompt)
     try:
         completion = client.chat.completions.create(
             model="deepseek-v3.2-exp",
@@ -392,7 +443,9 @@ BASE_HTML = """
 <head>
     <meta charset="UTF-8">
     <title>AI 智能估值系统 (DCF & Reverse DCF)</title>
+    <!-- 引入 Bootstrap 与 Icons -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
     <style>
         body { background-color: #f8f9fa; font-size: 0.95rem; }
         .card { margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
@@ -404,7 +457,7 @@ BASE_HTML = """
     </style>
 </head>
 <body>
-<nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
+<nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4 shadow-sm">
   <div class="container-fluid">
     <a class="navbar-brand fw-bold text-warning" href="/">📈 智能投研系统</a>
     <div class="collapse navbar-collapse">
@@ -456,22 +509,37 @@ DCF_CONTENT = r"""
 <div class="row">
     <!-- 左侧 AI 输入与字典 -->
     <div class="col-md-4">
-        <div class="card">
+        <div class="card border-primary">
             <div class="card-header bg-primary text-white">1. 数据自动获取与 AI 提取</div>
             <div class="card-body">
-                <!-- 自动化数据抓取工具条 -->
-                <div class="input-group mb-2 shadow-sm">
-                    <input type="text" class="form-control form-control-sm" id="ai-name" placeholder="输入公司名称或6位代码 (如：000001或平安银行)">
+
+                <div class="input-group mb-3 shadow-sm">
+                    <input type="text" class="form-control form-control-sm" id="ai-name" placeholder="公司名称或6位代码 (如: 000001)">
                     <button class="btn btn-sm btn-success fw-bold" id="btn-auto-fetch"><i class="bi bi-cloud-arrow-down"></i> 自动提取财报</button>
+
+                    <span class="input-group-text bg-light text-muted" style="font-size: 0.85rem;"><i class="bi bi-calendar-range me-1"></i>设定预测年数</span>
+                    <input type="number" class="form-control form-control-sm text-center fw-bold text-primary" id="ai-years" value="5" min="1" max="20" style="flex: 0 0 70px;">
                 </div>
 
-                <textarea class="form-control form-control-sm mb-2" id="ai-desc" rows="2" placeholder="公司主营业务与描述 (可自动填充)"></textarea>
-                <textarea class="form-control form-control-sm mb-2" id="ai-financials" rows="3" placeholder="在此粘贴合并的财报核心数据... (可自动填充)"></textarea>
-                <textarea class="form-control form-control-sm mb-3" id="ai-guidance" rows="2" placeholder="额外指导意见（选填，如：假设未来三年营收不增长）"></textarea>
+                <div class="mb-3">
+                    <label for="ai-desc" class="form-label text-muted small mb-1">公司业务与描述</label>
+                    <textarea class="form-control form-control-sm shadow-sm" id="ai-desc" rows="2" placeholder="自动提取后将在此填充..."></textarea>
+                </div>
 
-                <button class="btn btn-outline-primary w-100 fw-bold" id="btn-ai-generate">交给 AI 分析并构建参数字典</button>
+                <div class="mb-3">
+                    <label for="ai-financials" class="form-label text-muted small mb-1">核心财报数据</label>
+                    <textarea class="form-control form-control-sm shadow-sm" id="ai-financials" rows="3" placeholder="自动提取后将在此填充..."></textarea>
+                </div>
+
+                <div class="mb-3">
+                    <label for="ai-guidance" class="form-label text-muted small mb-1">额外指导意见 (选填)</label>
+                    <textarea class="form-control form-control-sm shadow-sm" id="ai-guidance" rows="2" placeholder="如：假设未来三年营收不增长..."></textarea>
+                </div>
+
+                <button class="btn btn-primary w-100 fw-bold shadow-sm" id="btn-ai-generate"><i class="bi bi-robot"></i> 交给 AI 分析并构建参数字典</button>
             </div>
         </div>
+
         <div class="card">
             <div class="card-header">参数字典互通区</div>
             <div class="card-body">
@@ -487,7 +555,7 @@ DCF_CONTENT = r"""
 
     <!-- 中间 参数编辑 -->
     <div class="col-md-4">
-        <div class="card border-primary">
+        <div class="card border-info">
             <div class="card-header">2. 估值核心假设与参数微调 <span class="badge bg-danger ms-2">单位统一: 万元</span></div>
             <div class="card-body">
                 <div class="row mb-2">
@@ -497,7 +565,7 @@ DCF_CONTENT = r"""
                     <div class="col-6"><label class="form-label">货币资金 (万元)</label><input type="number" class="form-control form-control-sm" id="param-cash" value="35000"></div>
                 </div>
                 <div class="row mb-2 mt-3">
-                    <div class="col-4"><label class="form-label">预测年数</label><input type="number" class="form-control form-control-sm" id="param-years" value="5"></div>
+                    <div class="col-4"><label class="form-label">预测年数</label><input type="number" class="form-control form-control-sm bg-light" id="param-years" value="5" readonly></div>
                     <div class="col-4"><label class="form-label">折现率 WACC</label><input type="number" step="0.01" class="form-control form-control-sm" id="param-discount" value="0.10"></div>
                     <div class="col-4"><label class="form-label">永续增长率</label><input type="number" step="0.01" class="form-control form-control-sm" id="param-term-growth" value="0.02"></div>
                 </div>
@@ -505,7 +573,7 @@ DCF_CONTENT = r"""
                 <div class="mb-2"><label class="form-label">EBIT 利润率 (用逗号分隔)</label><input type="text" class="form-control form-control-sm code-font" id="param-ebit-margin" value="0.10, 0.12, 0.13, 0.15, 0.15"></div>
                 <div class="mb-3"><label class="form-label">再投资率 (用逗号分隔，注意轻/重资产区别)</label><input type="text" class="form-control form-control-sm code-font" id="param-reinv-rate" value="0.3, 0.25, 0.2, 0.15, 0.15"></div>
 
-                <button class="btn btn-primary w-100 btn-lg" onclick="calcVal()">⚡ 开始折现计算</button>
+                <button class="btn btn-info text-white w-100 btn-lg shadow-sm" onclick="calcVal()">⚡ 开始折现计算</button>
             </div>
         </div>
     </div>
@@ -517,7 +585,7 @@ DCF_CONTENT = r"""
             <div class="card-body">
                 <div class="result-box"><div class="text-muted small">企业价值 (Enterprise Value)</div><div class="result-number" id="res-ev">0.00</div></div>
                 <div class="result-box bg-success text-white bg-opacity-10"><div class="text-muted small">合理股权市值 (Equity Value)</div><div class="result-number text-success" id="res-eq">0.00</div></div>
-                <div class="text-muted small">股权市值 = 企业价值 - 总负债 + 现金及现金等价物</div>
+                <div class="text-muted small"><i class="bi bi-info-circle"></i> 股权市值 = 企业价值 - 总负债 + 现金及现金等价物</div>
             </div>
         </div>
     </div>
@@ -528,7 +596,6 @@ DCF_CONTENT = r"""
 
 {% block scripts %}
 <script>
-    // --- 新增：自动化抓取接口请求逻辑 ---
     document.getElementById('btn-auto-fetch').onclick = async function() {
         const query = document.getElementById('ai-name').value.trim();
         if (!query) {
@@ -537,7 +604,7 @@ DCF_CONTENT = r"""
         }
 
         this.disabled = true; 
-        this.innerText = "正在云端获取中...";
+        this.innerHTML = `<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 正在云端获取...`;
         showToast("正在通过 Tushare 获取最新年报及基本面数据，请稍等...");
 
         try {
@@ -574,9 +641,14 @@ DCF_CONTENT = r"""
         document.getElementById('param-tax').value = dict.current_financials.tax_rate || 0;
         document.getElementById('param-debt').value = dict.current_financials.total_debt || 0; 
         document.getElementById('param-cash').value = dict.current_financials.cash_and_equivalents || 0;
-        document.getElementById('param-years').value = dict.valuation_assumptions.projection_years || 5; 
+
+        const years = dict.valuation_assumptions.projection_years || 5;
+        document.getElementById('param-years').value = years; 
+        document.getElementById('ai-years').value = years; // 互相联动同步
+
         document.getElementById('param-discount').value = dict.valuation_assumptions.discount_rate || 0.1;
         document.getElementById('param-term-growth').value = dict.valuation_assumptions.terminal_growth_rate || 0.02;
+
         document.getElementById('param-rev-growth').value = dict.scenario.revenue_growth_rates.join(', ');
         document.getElementById('param-ebit-margin').value = dict.scenario.ebit_margin_rates.join(', '); 
         document.getElementById('param-reinv-rate').value = dict.scenario.reinvestment_rate.join(', ');
@@ -604,7 +676,7 @@ DCF_CONTENT = r"""
     function copyDict() { navigator.clipboard.writeText(document.getElementById('dict-textarea').value); showToast("已复制"); }
 
     document.getElementById('btn-ai-generate').onclick = async function() {
-        this.disabled = true; this.innerText = "正在思考请求中...";
+        this.disabled = true; this.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 正在让AI深度分析中...';
         try {
             const res = await fetch('/api/generate', { method: 'POST', headers:{'Content-Type':'application/json'},
                 body: JSON.stringify({ 
@@ -612,17 +684,17 @@ DCF_CONTENT = r"""
                     company_description: document.getElementById('ai-desc').value, 
                     financial_statements: document.getElementById('ai-financials').value, 
                     additional_guidance: document.getElementById('ai-guidance').value,
-                    projection_years: document.getElementById('param-years').value 
+                    projection_years: document.getElementById('ai-years').value 
                 })
             });
             const d = await res.json();
             if(d.status === 'success') { 
                 document.getElementById('dict-textarea').value = JSON.stringify(d.data, null, 4); 
                 parseDict(d.data); 
-                showToast("AI解析成功"); 
+                showToast("AI 解析推演成功！"); 
             } else { showToast(d.message, true); }
         } catch(e) { showToast("请求错误", true); }
-        this.disabled = false; this.innerText = "交给 AI 分析并构建参数字典";
+        this.disabled = false; this.innerHTML = '<i class="bi bi-robot"></i> 交给 AI 分析并构建参数字典';
     };
 
     async function calcVal() {
@@ -655,13 +727,12 @@ REVERSE_DCF_CONTENT = r"""
 {% extends "base.html" %}
 {% block content %}
 <h4 class="mb-3 text-warning">反向 DCF 模型 (探索市场隐含预期)</h4>
-<!-- 保持反向DCF页面一致的内容 -->
 <div class="row">
     <div class="col-md-5">
         <div class="card border-warning">
             <div class="card-header bg-warning text-dark fw-bold">输入已知财务参数 <span class="badge bg-danger ms-2">单位统一: 万元</span></div>
             <div class="card-body">
-                <div class="p-3 bg-warning bg-opacity-10 border border-warning rounded mb-3">
+                <div class="p-3 bg-warning bg-opacity-10 border border-warning rounded mb-3 shadow-sm">
                     <label class="form-label fw-bold text-dark fs-6">🎯 当前实际市值 (Current Market Cap) [万元]</label>
                     <input type="number" class="form-control form-control-lg text-primary fw-bold" id="param-market-cap" value="300000">
                     <small class="text-muted">输入当前股票市场的总市值，算法将逆推需要多高的增速才能支撑该市值。</small>
@@ -683,7 +754,7 @@ REVERSE_DCF_CONTENT = r"""
                 <div class="mb-2 mt-3"><label class="form-label">EBIT 利润率预测 (逗号分隔)</label><input type="text" class="form-control form-control-sm code-font" id="param-ebit-margin" value="0.10, 0.12, 0.13, 0.15, 0.15"></div>
                 <div class="mb-3"><label class="form-label">再投资率预测 (逗号分隔)</label><input type="text" class="form-control form-control-sm code-font" id="param-reinv-rate" value="0.3, 0.25, 0.2, 0.15, 0.15"></div>
 
-                <button class="btn btn-warning w-100 btn-lg fw-bold" onclick="calcReverse()"><i class="bi bi-search"></i> 🔍 开始二分查找运算</button>
+                <button class="btn btn-warning w-100 btn-lg fw-bold shadow-sm" onclick="calcReverse()"><i class="bi bi-search"></i> 🔍 开始二分查找运算</button>
             </div>
         </div>
     </div>
@@ -691,7 +762,7 @@ REVERSE_DCF_CONTENT = r"""
         <div class="card border-primary">
             <div class="card-header bg-primary text-white">隐含预期结果分析</div>
             <div class="card-body">
-                <div class="result-box bg-dark text-white p-4 text-center mb-3">
+                <div class="result-box bg-dark text-white p-4 text-center mb-3 shadow-sm">
                     <div class="text-white-50 fs-5 mb-2">市场价格隐含的年复合营收增长率 (Implied CAGR)</div>
                     <div class="result-number text-warning" style="font-size: 3.5rem;" id="res-implied-g">0.00%</div>
                     <div id="res-msg" class="mt-2 text-info">等待计算...</div>
